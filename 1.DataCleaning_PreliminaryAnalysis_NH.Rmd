@@ -1,0 +1,151 @@
+---
+title: "1.DataCleaning_PreliminaryAnalysis_NH"
+author: "Nour Hanafi"
+date: "27/11/2023, last updated 08-12-2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, cache = T)
+
+library(dplyr)
+library(data.table)
+library(knitr)
+library(ggplot2)
+library(GenomicRanges)
+library(stringr)
+library(plyr)
+library(regioneR)
+
+```
+
+```{r, message = F}
+#descriptive cohort summary
+
+#abc file
+abc = fread("../AllPredictions.AvgHiC.ABC0.015.minus150.ForABCPaperV3_bipolarneuron_astrocyte_neuronalprogenitor.txt", stringsAsFactors = F, header = T)
+
+#duo/singleton variant file
+#df = fread("../kim_genomes_0721.single_duos.all_vars.std_analysis.xls", stringsAsFactors = F, na.strings=c("","NA"))
+
+#trio variant file
+trios = fread("../kim_genomes_0721.trios.all_vars.std_analysis.xls", stringsAsFactors = F)
+
+df = trios
+
+#clean up mode of inheritance column
+df = df %>% dplyr::rename(mode = "#mode") 
+df$mode = gsub("slivar_comphet.+", "slivar_comphet", df$mode)
+
+#get total number of variants
+total.num = as.data.frame(table(df$sample_id), col.names = c("Sample ID", "Total number of variants"))
+
+ggplot(data=total.num, aes(x=Var1, y=Freq, fill=Var1)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+kable(table(df$sample_id), col.names = c("Sample ID", "Total number of variants"), caption = "Total number of variants in trio file")
+
+#get total number of variants by MOI
+moi_pre = df %>% group_by(sample_id, mode) %>% dplyr::summarize(n = n())
+
+ggplot(data=moi_pre, aes(x=sample_id, y=n, fill=mode)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#Number of de novo variants is too high. There should be about 45-60 true de novo variants per genome (although we usually see more due to difficulty in distinguising between true DNMs and false positives, but not to this degree. See https://doi.org/10.3389/fgene.2022.983668)
+
+#split ab column up so that I can do some quick QC checks
+ab = str_split(df$`allele_balance(sample,dad,mom)`, ",", n = 3)
+df.ab = as.data.frame(do.call(rbind, ab))
+colnames(df.ab) <- c("sample_ab", "dad_ab", "mom_ab")
+df = cbind(df, df.ab)
+dp = str_split(df$`depths(sample,dad,mom)`, ",", n = 3)
+df.dp = as.data.frame(do.call(rbind, dp))
+colnames(df.dp) <- c("sample_dp", "dad_dp", "mom_dp")
+df = cbind(df, df.dp)
+
+
+kable(df %>% group_by(mode) %>% dplyr::summarize(mAB = mean(as.numeric(sample_ab)), mDP = mean(as.numeric(sample_dp))))
+
+boxplot(as.numeric(sample_ab) ~ mode, data = df)
+boxplot(as.numeric(sample_dp) ~ mode, data = df)
+
+
+#The AB is likely off very low for de novo variants because we are capturing a lot of somatic variation and potentially also sequencing error. I will try to limit this by adding an  AB filter of >= 0.3.
+
+df2 = df %>% filter(sample_ab >= 0.3)
+kable(df2 %>% group_by(mode) %>% dplyr::summarize(mAB = mean(as.numeric(sample_ab)), mDP = mean(as.numeric(sample_dp))))
+
+boxplot(as.numeric(sample_ab) ~ mode, data = df2)
+boxplot(as.numeric(sample_dp) ~ mode, data = df2)
+
+moi = df2 %>% group_by(sample_id, mode) %>% dplyr::summarize(n = n())
+ggplot(data=moi, aes(x=sample_id, y=n, fill=mode)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#I still think that the number of de novo mutations is too high, particularly for the 2 outlier samples, but this is better than before.
+
+#now, to get more summary data
+
+types = df2 %>% group_by(highest_impact) %>% dplyr::summarize(n = n())
+kable(types)
+types = types %>% mutate(Proportion = types$n/sum(types$n))
+
+ggplot(data=types, aes(x=highest_impact, y=Proportion)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#This seems to me in-line with what I would expect from a typical genome, where ~75% is intergenic. ~24% is intronic, and ~2% is exonic, although also keeping in mind that these variants have likely already been filtered down by AF.
+
+df2 = df2 %>% filter(`mode` == "potential_denovo" | `mode` == "denovo") #decided not to include x-denovo as technically the variant effect in that group differs depending on whether you are looking at males or females
+
+types2 = df2 %>% group_by(highest_impact) %>% dplyr::summarize(n = n())
+
+#Now to show distribution of de novo variants
+
+ggplot(data=types2, aes(x=highest_impact, y=n)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+```
+
+```{r, eval = F}
+coords = str_split(df2$`chr:pos:ref:alt`, ":", n = 4)
+df.coords = as.data.frame(do.call(rbind, coords))
+colnames(df.coords) <- c("chr", "start", "ref", "alt")
+df.coords = df.coords %>% mutate(end = "NA")
+
+for (i in 1:nrow(df.coords)){
+  df.coords[i,'end'] = as.numeric(df.coords[i,'start']) + as.numeric(nchar(df.coords[i,'ref'])) 
+}
+
+#I did a few things differently from Richard here: (1) used data tables's foverlaps() function instead of granges -> produces output that is much easier to understand and maniuplate, + is faster. (2) Set end coordinate to START + the length of the alternate variant. For SNPs and insertions, this would just be START +1, but for DEls this would be a larger coordinate, in order to account for cases where a DEL starts before a reg element but ends within a reg element. 
+
+#Note: VCFs are 1-start and BED files are 0-start - should I make a correction? And if so, should it be a global correction, or is it different for insertions and deletions?
+
+df.coords = df.coords %>% relocate(end, .after = "start")
+df.coords$start = as.numeric(df.coords$start)
+df.coords$end = as.numeric(df.coords$end)
+
+df.final = cbind(df.coords, df2)
+
+#abc analysis
+setkey(abc, chr, start, end)
+df.final = as.data.table(df.final)
+setkey(df.final, chr, start, end)
+test = foverlaps(df.final, abc)
+ovs = test[!is.na(test$start)]
+
+
+var_dis = as.data.frame(table(ovs$highest_impact), colnames = c("highest_impact", "Frequency"))
+
+ggplot(data=var_dis, aes(x=Var1, y=Freq, fill=Var1)) +
+geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+```
